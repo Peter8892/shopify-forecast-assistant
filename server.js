@@ -11,9 +11,9 @@ app.use(express.json());
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE;         
-const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;         
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || ""; 
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
+const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
 
 // ---------- HELPERS ----------
@@ -52,7 +52,7 @@ async function fetchCustomerOrders({ customer_id, email, months = 6 }) {
 
 // Aggregate all line items with monthly breakdown
 function aggregateLineItemsWithSeasonality(orders) {
-  const map = {}; // variant_id -> { title, totalQty, monthlyQty: {0-11} }
+  const map = {};
 
   for (const o of orders) {
     const month = new Date(o.created_at).getMonth();
@@ -87,7 +87,7 @@ function buildForecast(itemsMap, months = 6) {
     }
   }
 
-  return forecast.sort((a, b) => b.qty - a.qty); // largest quantities first
+  return forecast.sort((a, b) => b.qty - a.qty);
 }
 
 // Build Shopify cart URL
@@ -108,15 +108,14 @@ app.post("/forecast", async (req, res) => {
     if (!customerId && !email) return res.status(400).json({ error: "Provide customer_id or email" });
 
     const orders = await fetchCustomerOrders({ customer_id: customerId, email, months: 6 });
-    if (!orders.length) return res.json({ cartUrl: "/cart", message: "No purchases in the last 6 months" });
+    if (!orders.length) return res.json({ cartUrl: "/cart", items: [] });
 
     const agg = aggregateLineItemsWithSeasonality(orders);
     const forecastItems = buildForecast(agg, 6);
 
-    if (!forecastItems.length) return res.json({ cartUrl: "/cart", message: "No forecastable items found" });
-
     const cartUrl = buildCartUrl(forecastItems);
 
+    // Forward to n8n if configured
     if (N8N_WEBHOOK_URL) {
       try {
         await fetch(N8N_WEBHOOK_URL, {
