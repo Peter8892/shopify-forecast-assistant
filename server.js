@@ -11,15 +11,22 @@ app.use(express.json());
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
-const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;         
+const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;         
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || ""; 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
+const TOP_ITEMS = 10; // max items to include in forecast
 
 // ---------- HELPERS ----------
 function isoMonthsAgo(months = 6) {
   const d = new Date();
   d.setMonth(d.getMonth() - months);
+  return d.toISOString();
+}
+
+function isoYearsAgo(years = 2) {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - years);
   return d.toISOString();
 }
 
@@ -41,59 +48,79 @@ async function shopifyFetch(path) {
 }
 
 // Fetch orders for a customer
-async function fetchCustomerOrders({ customer_id, email, months = 6 }) {
-  const created_at_min = encodeURIComponent(isoMonthsAgo(months));
-  let path = `/orders.json?status=any&created_at_min=${created_at_min}&limit=250`;
-  if (customer_id) path += `&customer_id=${customer_id}`;
-  if (email && !customer_id) path += `&email=${encodeURIComponent(email)}`;
-  const data = await shopifyFetch(path);
-  return data.orders || [];
+async function fetchCustomerOrders({ customer_id, email, months = 6, years = 2 }) {
+  const recent_min = encodeURIComponent(isoMonthsAgo(months));
+  const seasonal_min = encodeURIComponent(isoYearsAgo(years));
+  
+  let pathRecent = `/orders.json?status=any&created_at_min=${recent_min}&limit=250`;
+  let pathSeasonal = `/orders.json?status=any&created_at_min=${seasonal_min}&limit=250`;
+
+  if (customer_id) {
+    pathRecent += `&customer_id=${customer_id}`;
+    pathSeasonal += `&customer_id=${customer_id}`;
+  }
+  if (email && !customer_id) {
+    pathRecent += `&email=${encodeURIComponent(email)}`;
+    pathSeasonal += `&email=${encodeURIComponent(email)}`;
+  }
+
+  const [recentData, seasonalData] = await Promise.all([
+    shopifyFetch(pathRecent),
+    shopifyFetch(pathSeasonal)
+  ]);
+
+  return { 
+    recentOrders: recentData.orders || [],
+    seasonalOrders: seasonalData.orders || []
+  };
 }
 
-// Aggregate all line items with monthly breakdown
-function aggregateLineItemsWithSeasonality(orders) {
-  const map = {};
+// Aggregate line items with monthly breakdown
+function aggregateLineItemsWithSeasonality(recentOrders, seasonalOrders) {
+  const map = {}; // variant_id -> { title, totalQty }
 
-  for (const o of orders) {
-    const month = new Date(o.created_at).getMonth();
+  const currentMonth = new Date().getMonth();
+
+  // recent orders → average monthly quantities
+  for (const o of recentOrders) {
     for (const li of o.line_items || []) {
       const vid = String(li.variant_id || li.product_id);
-      if (!map[vid]) map[vid] = { title: li.name || li.title || "", totalQty: 0, monthlyQty: {} };
+      if (!map[vid]) map[vid] = { title: li.name || li.title || "", totalQty: 0 };
       map[vid].totalQty += li.quantity || 0;
-      map[vid].monthlyQty[month] = (map[vid].monthlyQty[month] || 0) + (li.quantity || 0);
+    }
+  }
+
+  // seasonal orders → only same month as now
+  for (const o of seasonalOrders) {
+    const month = new Date(o.created_at).getMonth();
+    if (month !== currentMonth) continue; // skip other months
+    for (const li of o.line_items || []) {
+      const vid = String(li.variant_id || li.product_id);
+      if (!map[vid]) map[vid] = { title: li.name || li.title || "", totalQty: 0 };
+      map[vid].totalQty += li.quantity || 0;
     }
   }
 
   return map;
 }
 
-// Build forecast combining recurring + seasonal for current month
-function buildForecast(itemsMap, months = 6) {
+// Build forecast combining recent + seasonal, take top N
+function buildForecast(itemsMap, recentMonths = 6, topN = TOP_ITEMS) {
   const forecast = [];
-  const currentMonth = new Date().getMonth();
-
   for (const [variant_id, data] of Object.entries(itemsMap)) {
-    const avgMonthlyQty = data.totalQty / months;
-    const regularQty = avgMonthlyQty > 0 ? Math.round(avgMonthlyQty) : 0;
-    const seasonalQty = data.monthlyQty[currentMonth] || 0;
-
-    const totalQty = regularQty + seasonalQty;
-    if (totalQty > 0) {
-      forecast.push({
-        variant_id,
-        qty: totalQty,
-        title: data.title
-      });
-    }
+    const avgRecentQty = data.totalQty / recentMonths; // approximate recurring
+    const totalQty = Math.round(avgRecentQty) > 0 ? Math.round(avgRecentQty) : 1;
+    forecast.push({ variant_id, qty: totalQty, title: data.title });
   }
 
-  return forecast.sort((a, b) => b.qty - a.qty);
+  // sort descending and limit top N
+  return forecast.sort((a, b) => b.qty - a.qty).slice(0, topN);
 }
 
 // Build Shopify cart URL
 function buildCartUrl(items) {
+  if (!items || !items.length) return "/cart";
   const parts = items.map(i => `${i.variant_id}:${i.qty}`);
-  if (parts.length === 0) return "/cart";
   return `/cart/${parts.join(",")}`;
 }
 
@@ -107,15 +134,18 @@ app.post("/forecast", async (req, res) => {
 
     if (!customerId && !email) return res.status(400).json({ error: "Provide customer_id or email" });
 
-    const orders = await fetchCustomerOrders({ customer_id: customerId, email, months: 6 });
-    if (!orders.length) return res.json({ cartUrl: "/cart", items: [] });
+    const { recentOrders, seasonalOrders } = await fetchCustomerOrders({ customer_id: customerId, email, months: 6, years: 2 });
 
-    const agg = aggregateLineItemsWithSeasonality(orders);
-    const forecastItems = buildForecast(agg, 6);
+    if (!recentOrders.length && !seasonalOrders.length) 
+      return res.json({ cartUrl: "/cart", message: "No purchases in the last 2 years" });
+
+    const agg = aggregateLineItemsWithSeasonality(recentOrders, seasonalOrders);
+    const forecastItems = buildForecast(agg, 6, TOP_ITEMS);
+
+    if (!forecastItems.length) return res.json({ cartUrl: "/cart", message: "No forecastable items found" });
 
     const cartUrl = buildCartUrl(forecastItems);
 
-    // Forward to n8n if configured
     if (N8N_WEBHOOK_URL) {
       try {
         await fetch(N8N_WEBHOOK_URL, {
@@ -141,8 +171,5 @@ app.post("/forecast", async (req, res) => {
     return res.status(err.status || 500).json({ error: err.message || "server_error" });
   }
 });
-
-// Optional: cached endpoint
-app.get("/forecast/cached", (req, res) => res.status(204).end());
 
 app.listen(PORT, () => console.log(`✅ Forecast Assistant listening on port ${PORT}`));
