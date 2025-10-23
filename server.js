@@ -15,7 +15,7 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;         
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || ""; 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
-const TOP_ITEMS = 10; // max items to include in forecast
+const TOP_ITEMS = 20; // max items to include in forecast
 
 // ---------- HELPERS ----------
 function isoMonthsAgo(months = 6) {
